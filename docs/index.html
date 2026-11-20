@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>SonicVision</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+<main>
+  <header>
+    <h1>SonicVision</h1>
+    <p>Live monochrome video over audible sound.</p>
+  </header>
+  <section aria-label="Video">
+    <div class="screens">
+      <figure><canvas id="out" width="64" height="48" aria-label="Outgoing frame"></canvas><figcaption>Outgoing</figcaption></figure>
+      <figure><canvas id="in" width="64" height="48" aria-label="Received frame"></canvas><figcaption>Received</figcaption></figure>
+    </div>
+    <video id="camera" playsinline muted hidden></video>
+  </section>
+  <section aria-label="Transmission controls">
+    <div class="controls">
+      <label>Source<select id="source"><option value="synthetic">Synthetic</option><option value="camera">Camera</option></select></label>
+      <label>Resolution<select id="size"><option value="0">32 × 24</option><option value="1" selected>64 × 48</option><option value="2">128 × 96</option></select></label>
+      <label>Target frame rate<select id="fps"><option value="1" selected>1 fps</option><option value="2">2 fps</option><option value="3">3 fps</option><option value="5">5 fps</option></select></label>
+      <label>Speaker gain<input id="gain" type="range" min="0" max="0.4" step="0.01" value="0.15"></label>
+    </div>
+    <div class="actions">
+      <button id="send" disabled>Transmit</button>
+      <button id="receive" disabled>Listen</button>
+      <button id="loop" disabled>Digital loopback</button>
+      <button id="bench" disabled>Send benchmark</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+    <p id="status" role="status">Loading modem…</p>
+  </section>
+  <section aria-label="Receiver statistics">
+    <dl class="stats">
+      <div><dt>Received bitrate</dt><dd id="bitrate">—</dd></div>
+      <div><dt>Received frame rate</dt><dd id="rate">—</dd></div>
+      <div><dt>Packet loss</dt><dd id="loss">—</dd></div>
+      <div><dt>Frame latency</dt><dd id="latency">—</dd></div>
+    </dl>
+    <p id="benchmark" hidden></p>
+    <details><summary>Device diagnostics</summary><p id="mic">Microphone idle.</p><p id="codecs">Checking WebCodecs…</p></details>
+  </section>
+</main>
+</body>
+</html>
