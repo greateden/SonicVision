@@ -1,7 +1,8 @@
 class Microphone extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.block = new Float32Array(2048);
+    this.blockSize = Math.round(sampleRate * 2048 / 48000);
+    this.block = new Float32Array(this.blockSize);
     this.used = 0;
     this.credits = 8;
     this.dropped = false;
@@ -21,7 +22,7 @@ class Microphone extends AudioWorkletProcessor {
       }
       this.credits--;
       this.port.postMessage({ samples: this.block, gap: this.dropped }, [this.block.buffer]);
-      this.block = new Float32Array(2048);
+      this.block = new Float32Array(this.blockSize);
       this.dropped = false;
     }
     return true;
