@@ -1,5 +1,5 @@
 import init, { encode, sample_rate } from './modem/sonance_wasm.js';
-import { compress, packet, unpack, sizes, guard, benchmarkCount, benchmarkPayload } from './protocol.js';
+import { compress, packet, unpack, sizes, colourSize, guard, benchmarkCount, benchmarkPayload } from './protocol.js';
 
 const el = id => document.getElementById(id);
 const modes = ['send', 'receive', 'loop', 'bench'];
@@ -7,6 +7,7 @@ const camera = el('camera');
 const capture = document.createElement('canvas');
 const captureContext = capture.getContext('2d', { willReadFrequently: true });
 const profile = 'balanced';
+const secure = window.isSecureContext;
 let active;
 let ready = false;
 let modemRate;
@@ -15,6 +16,7 @@ function status(text) { el('status').textContent = text; }
 
 function buttons() {
   for (const mode of modes) el(mode).disabled = !ready || Boolean(active);
+  if (!secure) el('receive').disabled = true;
   el('stop').disabled = !active;
   el('source').disabled = Boolean(active);
 }
@@ -35,20 +37,29 @@ function stop(run, message = 'Stopped.') {
   status(message);
 }
 
-function display(id, { width, height, pixels }) {
+function display(id, { width, height, pixels, colour }) {
   const canvas = el(id);
   if (canvas.width !== width) canvas.width = width;
   if (canvas.height !== height) canvas.height = height;
   const context = canvas.getContext('2d');
   const image = context.createImageData(width, height);
   for (let i = 0; i < width * height; i++) {
-    const value = pixels[i >> 3] & (128 >> (i & 7)) ? 255 : 0;
-    image.data.set([value, value, value, 255], i * 4);
+    const offset = i * 4;
+    if (colour) {
+      const value = pixels[i];
+      image.data[offset] = (value >> 5) * 255 / 7;
+      image.data[offset + 1] = ((value >> 2) & 7) * 255 / 7;
+      image.data[offset + 2] = (value & 3) * 85;
+    } else {
+      const value = pixels[i >> 3] & (128 >> (i & 7)) ? 255 : 0;
+      image.data[offset] = image.data[offset + 1] = image.data[offset + 2] = value;
+    }
+    image.data[offset + 3] = 255;
   }
   context.putImageData(image, 0, 0);
 }
 
-function captureFrame(size, sequence, useCamera) {
+function captureFrame(size, sequence, useCamera, colour) {
   const [width, height] = sizes[size];
   capture.width = width;
   capture.height = height;
@@ -57,11 +68,12 @@ function captureFrame(size, sequence, useCamera) {
   } else {
     captureContext.fillStyle = 'black';
     captureContext.fillRect(0, 0, width, height);
-    captureContext.fillStyle = 'white';
+    captureContext.fillStyle = colour ? '#f00' : 'white';
     captureContext.fillRect(sequence * 5 % (width * 3 / 4), height / 4, width / 4, height / 2);
+    if (colour) captureContext.fillStyle = '#0af';
     captureContext.fillRect(0, height - 2, sequence * 3 % width, 2);
   }
-  return compress(captureContext.getImageData(0, 0, width, height).data, size);
+  return compress(captureContext.getImageData(0, 0, width, height).data, size, colour);
 }
 
 function updateStats(run) {
@@ -218,10 +230,11 @@ function sendNext(run) {
   try {
     const isBench = run.mode === 'bench';
     const isLoop = run.mode === 'loop';
-    const size = Number(el('size').value);
+    const colour = el('size').value === 'colour';
+    const size = colour ? colourSize : Number(el('size').value);
     const timestamp = Date.now();
     const sequence = run.sequence & 65535;
-    const frame = isBench ? { kind: 6, payload: benchmarkPayload } : captureFrame(size, sequence, run.useCamera);
+    const frame = isBench ? { kind: 6, payload: benchmarkPayload } : captureFrame(size, sequence, run.useCamera, colour);
     const fields = { ...frame, timestamp, sequence, session: run.session };
     if (isBench && !run.interval) {
       const probe = encode(profile, packet(fields));
@@ -323,9 +336,15 @@ async function probeCodecs() {
       return tx.supported && rx.supported ? codec : '';
     } catch { return ''; }
   }));
-  return `WebCodecs encode/decode probe: ${codecs.filter(Boolean).join(', ') || 'no matching configuration'}. Video uses monochrome frames.`;
+  return `WebCodecs encode/decode probe: ${codecs.filter(Boolean).join(', ') || 'no matching configuration'}. SonicVision currently uses its own frame codec.`;
 }
 
+if (!secure) {
+  const cameraOption = el('source').querySelector('[value="camera"]');
+  cameraOption.disabled = true;
+  el('source').value = 'synthetic';
+  el('connection').hidden = false;
+}
 probeCodecs().then(result => { el('codecs').textContent = result; });
 init().then(() => {
   modemRate = sample_rate();

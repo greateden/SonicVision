@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
+    "start:lan": "TLS_CERT=.tls/site.pem TLS_KEY=.tls/site-key.pem node server.mjs",
     "test": "node --test"
   }
 }

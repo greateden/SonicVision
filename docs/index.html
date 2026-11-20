@@ -12,7 +12,7 @@
 <main>
   <header>
     <h1>SonicVision</h1>
-    <p>Live monochrome video over audible sound.</p>
+    <p>Send video over audible sound.</p>
   </header>
   <section aria-label="Video">
     <div class="screens">
@@ -24,7 +24,7 @@
   <section aria-label="Transmission controls">
     <div class="controls">
       <label>Source<select id="source"><option value="synthetic">Synthetic</option><option value="camera">Camera</option></select></label>
-      <label>Resolution<select id="size"><option value="0">32 × 24</option><option value="1" selected>64 × 48</option><option value="2">128 × 96</option></select></label>
+      <label>Video mode<select id="size"><option value="colour" selected>32 × 24 colour</option><option value="0">32 × 24 monochrome</option><option value="1">64 × 48 monochrome</option><option value="2">128 × 96 monochrome</option></select></label>
       <label>Target frame rate<select id="fps"><option value="1" selected>1 fps</option><option value="2">2 fps</option><option value="3">3 fps</option><option value="5">5 fps</option></select></label>
       <label>Speaker gain<input id="gain" type="range" min="0" max="0.4" step="0.01" value="0.15"></label>
     </div>
@@ -36,6 +36,7 @@
       <button id="stop" disabled>Stop</button>
     </div>
     <p id="status" role="status">Loading modem…</p>
+    <p id="connection" hidden>Camera and microphone access require trusted HTTPS on the LAN. Open the HTTPS address printed by the server, or use localhost on the Mac hosting this page.</p>
   </section>
   <section aria-label="Receiver statistics">
     <dl class="stats">

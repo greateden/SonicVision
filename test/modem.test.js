@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import init, { encode, sample_rate, WasmDecoder } from '../docs/modem/sonance_wasm.js';
-import { compress, packet, unpack, sizes, guard, Resampler, benchmarkPayload } from '../docs/protocol.js';
+import { compress, packet, unpack, sizes, colourSize, guard, Resampler, benchmarkPayload } from '../docs/protocol.js';
 
 await init({ module_or_path: await readFile(new URL('../docs/modem/sonance_wasm_bg.wasm', import.meta.url)) });
 const rate = sample_rate();
@@ -51,6 +51,36 @@ test('application CRC rejects one-bit corruption and truncated packets', () => {
     assert.equal(unpack(damaged), undefined);
   }
   assert.equal(unpack(original.subarray(0, -1)), undefined);
+});
+
+test('raw and run-length RGB332 preserve quantised colour through PCM', t => {
+  const { push, received } = receiver(t);
+  const [width, height] = sizes[colourSize];
+  const colours = [[255, 0, 0, 224], [0, 255, 0, 28], [0, 0, 255, 3], [160, 96, 64, 173]];
+  for (const [sequence, runLength] of [1, 64].entries()) {
+    const rgba = new Uint8Array(width * height * 4);
+    const expected = new Uint8Array(width * height);
+    for (let i = 0; i < expected.length; i++) {
+      const [red, green, blue, value] = colours[Math.floor(i / runLength) % colours.length];
+      rgba.set([red, green, blue, 255], i * 4);
+      expected[i] = value;
+    }
+    const frame = compress(rgba, colourSize, true);
+    assert.equal(frame.kind, 7 + sequence);
+    const fields = { ...frame, session: 1, sequence, timestamp: 1000 };
+    assert.equal(unpack(packet({ ...fields, payload: frame.payload.subarray(0, -1) })), undefined);
+    const bytes = packet(fields);
+    const pcm = encode(profile, bytes);
+    push(pcm);
+    push(silence());
+    assert.equal(received.length, sequence + 1);
+    assert.deepEqual(received[sequence], bytes);
+    const decoded = unpack(received[sequence]);
+    assert.equal(decoded.colour, true);
+    assert.deepEqual([decoded.width, decoded.height], [width, height]);
+    assert.deepEqual(decoded.pixels, expected);
+    t.diagnostic(`RGB332 ${frame.payload.length} bytes: ${(1 / (pcm.length / rate + guard)).toFixed(2)} fps airtime ceiling`);
+  }
 });
 
 test('PCM goodput and byte accuracy at each worst-case frame size', t => {

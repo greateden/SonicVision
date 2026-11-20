@@ -1,4 +1,5 @@
 export const sizes = [[32, 24], [64, 48], [128, 96]];
+export const colourSize = 0;
 export const guard = 0.14;
 export const benchmarkCount = 20;
 export const benchmarkPayload = Uint8Array.from({ length: 256 }, (_, i) => (i * 137) & 255);
@@ -44,22 +45,26 @@ export function unpack(bytes) {
         payload.length !== benchmarkPayload.length || !payload.every((b, i) => b === benchmarkPayload[i])) return;
     return { kind, session, sequence, timestamp, interval, bytes: payload.length };
   }
-  const size = sizes[kind >> 1];
+  const colour = kind === 7 || kind === 8;
+  const size = sizes[colour ? colourSize : kind >> 1];
   if (!size) return;
   const [width, height] = size;
-  const length = width * height / 8;
-  const pixels = kind & 1 ? decodeRuns(payload, length) : payload;
+  const length = colour ? width * height : width * height / 8;
+  const compressed = colour ? kind === 8 : Boolean(kind & 1);
+  const pixels = compressed ? decodeRuns(payload, length) : payload;
   if (pixels?.length !== length) return;
-  return { kind, session, sequence, timestamp, width, height, pixels, bytes: payload.length };
+  return { kind, session, sequence, timestamp, width, height, pixels, colour, bytes: payload.length };
 }
 
-// Encode repeated bytes as count/value pairs, with the packed bitmap as fallback.
-export function compress(rgba, size) {
+export function compress(rgba, size, colour = false) {
   const [width, height] = sizes[size];
-  const pixels = new Uint8Array(width * height / 8);
+  if (colour && size !== colourSize) throw new RangeError('Colour frames use 32 × 24 pixels.');
+  const pixels = new Uint8Array(colour ? width * height : width * height / 8);
   for (let i = 0; i < width * height; i++) {
     const offset = i * 4;
-    if (77 * rgba[offset] + 150 * rgba[offset + 1] + 29 * rgba[offset + 2] >= 32768) {
+    if (colour) {
+      pixels[i] = (rgba[offset] & 0xe0) | ((rgba[offset + 1] >> 3) & 0x1c) | (rgba[offset + 2] >> 6);
+    } else if (77 * rgba[offset] + 150 * rgba[offset + 1] + 29 * rgba[offset + 2] >= 32768) {
       pixels[i >> 3] |= 128 >> (i & 7);
     }
   }
@@ -70,9 +75,10 @@ export function compress(rgba, size) {
     runs.push(count, pixels[i]);
     i += count;
   }
+  const rawKind = colour ? 7 : size * 2;
   return runs.length < pixels.length
-    ? { kind: size * 2 + 1, payload: Uint8Array.from(runs) }
-    : { kind: size * 2, payload: pixels };
+    ? { kind: rawKind + 1, payload: Uint8Array.from(runs) }
+    : { kind: rawKind, payload: pixels };
 }
 
 function decodeRuns(payload, length) {
