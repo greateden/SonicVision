@@ -6,7 +6,7 @@ export const benchmarkPayload = Uint8Array.from({ length: 256 }, (_, i) => (i * 
 const header = 19;
 const magic = 0x5356;
 
-function crc(bytes) {
+export function crc(bytes) {
   let value = 0xffffffff;
   for (const byte of bytes) {
     value ^= byte;

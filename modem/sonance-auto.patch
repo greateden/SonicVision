@@ -1,0 +1,76 @@
+diff --git a/sonance-wasm/Cargo.toml b/sonance-wasm/Cargo.toml
+index 846385b..7505c5b 100644
+--- a/sonance-wasm/Cargo.toml
++++ b/sonance-wasm/Cargo.toml
+@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
+ # the root Cargo.toml `exclude`). wasm32-unknown-unknown has std, so keep the
+ # default `std` feature on.
+ sonance = { path = "../sonance" }
++sonance-link = { path = "../sonance-link" }
+ wasm-bindgen = "0.2"
+ num-complex = "0.4"
+ # Only needed when `encryption` is on: route getrandom to the browser's CSPRNG
+diff --git a/sonance-wasm/src/lib.rs b/sonance-wasm/src/lib.rs
+index 4c52cf6..668587e 100644
+--- a/sonance-wasm/src/lib.rs
++++ b/sonance-wasm/src/lib.rs
+@@ -18,6 +18,7 @@ use sonance::transport::{
+     pack_superframe, unpack_superframe, MultiTransportReceiver, TransportReceiver, TransportSender,
+ };
+ use sonance::{Decoder, Encoder, Event, Profile};
++use sonance_link::rate::RateRung;
+ use std::collections::VecDeque;
+ use wasm_bindgen::prelude::*;
+ 
+@@ -98,10 +99,25 @@ pub fn chirp_strength(profile: &str, pcm: &[f32]) -> f32 {
+     matched_filter(pcm, &template).peak.max(0.0)
+ }
+ 
++// SonicVision exposes the upstream Auto rate ladder for manually matched TX/RX
++// trials. The PHY header cannot negotiate the rate used to decode itself.
++fn auto_rung(profile: Profile, rung: u8) -> Result<RateRung, JsValue> {
++    RateRung::from_wire_id(rung)
++        .filter(|_| profile == Profile::Auto)
++        .ok_or_else(|| JsValue::from_str("Invalid Sonance Auto rung"))
++}
++
+ /// Encode a short message into PCM samples to play out the speaker.
+ #[wasm_bindgen]
+-pub fn encode(profile: &str, bytes: &[u8]) -> Vec<f32> {
+-    Encoder::new(profile_from_name(profile)).encode(bytes)
++pub fn encode(profile: &str, bytes: &[u8], rung: Option<u8>) -> Result<Vec<f32>, JsValue> {
++    let profile = profile_from_name(profile);
++    let encoder = if let Some(id) = rung {
++        let rung = auto_rung(profile, id)?;
++        Encoder::with_rate(profile, rung.qam, rung.code)
++    } else {
++        Encoder::new(profile)
++    };
++    Ok(encoder.encode(bytes))
+ }
+ 
+ // --- E1: live DSP visualization exports (spectrogram / constellation / ladder) ---
+@@ -327,12 +343,19 @@ pub struct WasmDecoder {
+ #[wasm_bindgen]
+ impl WasmDecoder {
+     #[wasm_bindgen(constructor)]
+-    pub fn new(profile: &str) -> WasmDecoder {
+-        WasmDecoder {
+-            inner: Decoder::new(profile_from_name(profile)),
++    pub fn new(profile: &str, rung: Option<u8>) -> Result<WasmDecoder, JsValue> {
++        let profile = profile_from_name(profile);
++        let inner = if let Some(id) = rung {
++            let rung = auto_rung(profile, id)?;
++            Decoder::with_rate(profile, rung.qam, rung.code)
++        } else {
++            Decoder::new(profile)
++        };
++        Ok(WasmDecoder {
++            inner,
+             decoded: VecDeque::new(),
+             stats: FrameStats::default(),
+-        }
++        })
+     }
+ 
+     /// Lower (or raise) the chirp acquisition thresholds for a weak/strong
