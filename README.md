@@ -1,26 +1,31 @@
 # SonicVision
 
-Send low-resolution video through a speaker to another device’s microphone. The browser handles video and audio. Hosting serves the app files only.
+SonicVision sends low-resolution video or benchmark records from a speaker to a microphone. The site serves static assets. Video, audio and benchmark data stay in the browser and device-to-device transmission uses sound.
 
 ## Run
 
-Open [SonicVision on GitHub Pages](https://greateden.github.io/SonicVision/) on both devices, or run `npm start` with Node.js 22+ and open `http://localhost:8080` on your Mac. **Digital loopback** tests the full codec silently, with no permissions when using the synthetic source.
+Use [GitHub Pages](https://greateden.github.io/SonicVision/) for the deployed version. To test this branch, run `npm start` with Node.js 22+ and open `http://localhost:8080` on the Mac. For a second device, serve the same branch over trusted HTTPS. See **Local HTTPS** below.
 
-## Try it on two devices
+### Digital colour video
 
-1. Place your Mac and iPhone close together in a quiet room. Keep both tabs open and disconnect headphones.
-2. Choose **Listen** on one device and allow microphone access. On the other, start with **Synthetic**, **32 × 24 colour** and **1 fps**. Click **Transmit** at low volume. Raise the volume gradually if needed. For a smaller payload, try **32 × 24 monochrome**. Use the same app version on both devices for colour.
-3. Try **Camera**, then swap roles. For a repeatable test, use **Send benchmark** while the other device listens. Record the result out of 20 packets for each direction, along with distance, volume and the microphone settings under **Device diagnostics**.
+Select **Synthetic**, **64 × 48 colour** and **Automatic**, then run **60 s digital video trial**. It submits a moving four-colour chart with 900 successive image IDs to WebCodecs at 15 fps. The receiver checks packet CRCs, reassembles compressed frames and waits for a keyframe after a dependency gap. The trial counts each ID once when the decoded pixels are drawn, then checks the visible ID, the colour patches and the reassembled bytes' CRC against the encoder output. Try **32 × 24 colour** for the smaller WebCodecs mode or **Camera** for live input. WebCodecs support and performance vary by device.
 
-Bitrate and frame rate use a rolling five-second window. Video loss counts gaps between received sequence numbers. Benchmark loss includes all 20 expected packets once any packet is heard. Latency is capture-to-display using the two device clocks, so sync them for an estimate.
+**Export JSON** saves the actual codec and framing bytes, keyframe sizes, missing IDs, queue peaks, decoder transitions and same-browser capture-to-canvas latency. `videoVerification.syntheticPass` requires all 900 source IDs in the 60-second display window. Legacy RGB332 and monochrome modes are available under **Legacy acoustic bitmap video**.
 
-## Local HTTPS on iPhone
+### Physical acoustic benchmark
 
-Camera and microphone access on the LAN requires a browser-trusted HTTPS origin. The GitHub Pages version supplies one. `npm start` serves HTTP on localhost by default for use on the Mac itself. The audio signal between the devices travels through the air in either setup.
+1. Open the same build on both devices. Wait for **Offline assets ready** under **Device diagnostics**. Use their built-in speakers and microphones, disable Wi-Fi, cellular and Bluetooth after loading, and keep both pages visible and the devices awake.
+2. Choose the same **Direction**, **Separation** and **Sonance PHY** on both devices. Start at 30 cm with **Balanced**, **256 bytes** and **1 record per preamble**. Use a quiet room and note the devices, OS versions, orientation and system volume. Start at low speaker gain.
+3. Click **Listen for benchmark** and grant microphone permission. When listening, click **Send 60 s benchmark** on the sender. After the sender finishes, wait two seconds, stop the listener and export JSON from both devices. Keep the two files paired even when the listener received zero packets.
+4. Summarise a completed run with `node modem/compare-trial.mjs sender.json receiver.json`. Repeat independently with the roles swapped. Run three trials per direction at 30 cm and again at 1 m for a directional comparison. Use the same procedure to compare FastWide or a matched Auto rung with four or eight records per preamble.
 
-If you already have `.tls/site.pem` and `.tls/site-key.pem`, start with `npm run start:lan`. The server prints the actual LAN addresses covered by the certificate. Keep the terminal running while testing.
+The summary gives CRC- and pattern-verified goodput over the full 60-second sender window, packet loss including leading and trailing gaps, and receiver decoder-release latency. That latency estimates time from the last captured PHY sample to receipt on the browser's main thread. The waveform duration is reported separately. No inter-device clock alignment is required. Record listener capture gaps and sender underruns alongside loss. Compressed WebCodecs video is available in digital loopback while the acoustic link is benchmarked.
 
-To create the files, install `mkcert` with `brew install mkcert` using the [Homebrew formula](https://formulae.brew.sh/formula/mkcert). On your Mac, find the current Wi-Fi IP address in System Settings → Wi-Fi → Details. Replace the example IP in the command below. `mkcert -install` creates and trusts a local development certificate authority on the Mac. The next `mkcert` command issues a certificate for the given IP. [Official mkcert project](https://github.com/FiloSottile/mkcert)
+## Local HTTPS
+
+If you already have a browser-trusted certificate and key for the Mac's Wi-Fi address in `.tls/site.pem` and `.tls/site-key.pem`, run `npm run start:lan` and use the printed address on both devices.
+
+To create a local certificate with mkcert, see the [official mkcert project](https://github.com/FiloSottile/mkcert) and the [Homebrew formula](https://formulae.brew.sh/formula/mkcert). Replace the example address with your Mac's current Wi-Fi IP. The first command creates and trusts a local development certificate authority on the Mac.
 
 ```sh
 mkcert -install
@@ -29,12 +34,6 @@ mkcert -cert-file .tls/site.pem -key-file .tls/site-key.pem 192.168.1.10
 npm run start:lan
 ```
 
-AirDrop only `rootCA.pem` from the directory printed by `mkcert -CAROOT`. Install its profile and enable full trust on your iPhone, then open the printed Wi-Fi HTTPS address in Safari while on the same LAN. Keep `rootCA-key.pem` and `site-key.pem` on the Mac. [Apple’s certificate trust steps](https://support.apple.com/en-us/102390)
+Install only the `rootCA.pem` certificate from the directory reported by `mkcert -CAROOT` on the iPhone. Enable full trust and keep both private keys on the Mac. [Apple certificate trust instructions](https://support.apple.com/en-us/102390)
 
-- If Safari times out, confirm the server is still running, both devices are on the same LAN, and the Mac firewall allows the connection. Guest Wi-Fi can block traffic between devices.
-- If Safari shows a certificate error, check iPhone root trust and the exact IP in the address bar. If the Mac’s Wi-Fi IP changed, issue a new site certificate for that address and restart the server.
-- If the page loads but camera or microphone access fails, check Safari’s site permissions. A plain HTTP LAN URL disables these controls.
-
-## Limits
-
-The colour mode uses 8 bits per pixel (3 red, 3 green, 2 blue). Each frame is independent. In PCM tests, a 768-byte raw colour frame had a **0.58 fps** airtime ceiling and a 24-byte run-length example had a **2.24 fps** ceiling, both including the 140 ms guard. Raw monochrome frames had ceilings of **0.92 fps at 64 × 48** and **0.33 fps at 128 × 96**. The selected frame rate is an upper bound. Mac ↔ iPhone acoustic performance still needs measurement. Run `npm test` for PCM verification or see the [modem comparison](modem/README.md).
+Run `npm test` for transport and simulated PCM tests. See [modem build and verification](modem/README.md) for the measured results and the optional Cyrinx experiment.

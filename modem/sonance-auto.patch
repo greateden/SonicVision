@@ -1,0 +1,158 @@
+diff --git a/sonance-wasm/Cargo.toml b/sonance-wasm/Cargo.toml
+index 846385b..7505c5b 100644
+--- a/sonance-wasm/Cargo.toml
++++ b/sonance-wasm/Cargo.toml
+@@ -19,2 +19,3 @@ crate-type = ["cdylib", "rlib"]
+ sonance = { path = "../sonance" }
++sonance-link = { path = "../sonance-link" }
+ wasm-bindgen = "0.2"
+diff --git a/sonance-wasm/src/lib.rs b/sonance-wasm/src/lib.rs
+index 4c52cf6..92ea3fc 100644
+--- a/sonance-wasm/src/lib.rs
++++ b/sonance-wasm/src/lib.rs
+@@ -20,2 +20,3 @@ use sonance::transport::{
+ use sonance::{Decoder, Encoder, Event, Profile};
++use sonance_link::rate::RateRung;
+ use std::collections::VecDeque;
+@@ -100,6 +101,21 @@ pub fn chirp_strength(profile: &str, pcm: &[f32]) -> f32 {
+
++// SonicVision exposes the upstream Auto rate ladder for manually matched TX/RX
++// trials. The PHY header cannot negotiate the rate used to decode itself.
++fn auto_rung(profile: Profile, rung: u8) -> Result<RateRung, JsValue> {
++    RateRung::from_wire_id(rung)
++        .filter(|_| profile == Profile::Auto)
++        .ok_or_else(|| JsValue::from_str("Invalid Sonance Auto rung"))
++}
++
+ /// Encode a short message into PCM samples to play out the speaker.
+ #[wasm_bindgen]
+-pub fn encode(profile: &str, bytes: &[u8]) -> Vec<f32> {
+-    Encoder::new(profile_from_name(profile)).encode(bytes)
++pub fn encode(profile: &str, bytes: &[u8], rung: Option<u8>) -> Result<Vec<f32>, JsValue> {
++    let profile = profile_from_name(profile);
++    let encoder = if let Some(id) = rung {
++        let rung = auto_rung(profile, id)?;
++        Encoder::with_rate(profile, rung.qam, rung.code)
++    } else {
++        Encoder::new(profile)
++    };
++    Ok(encoder.encode(bytes))
+ }
+@@ -322,3 +338,4 @@ pub struct WasmDecoder {
+     inner: Decoder,
+-    decoded: VecDeque<Vec<u8>>,
++    decoded: VecDeque<(Vec<u8>, usize)>,
++    last_message_end: usize,
+     stats: FrameStats,
+@@ -329,8 +346,16 @@ impl WasmDecoder {
+     #[wasm_bindgen(constructor)]
+-    pub fn new(profile: &str) -> WasmDecoder {
+-        WasmDecoder {
+-            inner: Decoder::new(profile_from_name(profile)),
++    pub fn new(profile: &str, rung: Option<u8>) -> Result<WasmDecoder, JsValue> {
++        let profile = profile_from_name(profile);
++        let inner = if let Some(id) = rung {
++            let rung = auto_rung(profile, id)?;
++            Decoder::with_rate(profile, rung.qam, rung.code)
++        } else {
++            Decoder::new(profile)
++        };
++        Ok(WasmDecoder {
++            inner,
+             decoded: VecDeque::new(),
++            last_message_end: 0,
+             stats: FrameStats::default(),
+-        }
++        })
+     }
+@@ -352,4 +377,5 @@ impl WasmDecoder {
+         let decoded = &mut self.decoded;
++        let end = self.inner.last_frame_end();
+         drain_events(&mut self.inner, &mut self.stats, |payload| {
+-            decoded.push_back(payload);
++            decoded.push_back((payload, end));
+             false
+@@ -361,3 +387,10 @@ impl WasmDecoder {
+     pub fn take_message(&mut self) -> Option<Vec<u8>> {
+-        self.decoded.pop_front()
++        let (payload, end) = self.decoded.pop_front()?;
++        self.last_message_end = end;
++        Some(payload)
++    }
++
++    /// Exclusive PCM sample index for the message returned by take_message.
++    pub fn message_end_sample(&self) -> usize {
++        self.last_message_end
+     }
+diff --git a/sonance/src/codec.rs b/sonance/src/codec.rs
+index dc29cfb..3435715 100644
+--- a/sonance/src/codec.rs
++++ b/sonance/src/codec.rs
+@@ -183,2 +183,5 @@ pub struct Decoder {
+     buf: Vec<Sample>,
++    discarded_samples: usize,
++    last_frame_end: usize,
++    expected_end: usize,
+     events: std::collections::VecDeque<Event>,
+@@ -222,2 +225,5 @@ impl Decoder {
+             buf: Vec::new(),
++            discarded_samples: 0,
++            last_frame_end: 0,
++            expected_end: 0,
+             events: std::collections::VecDeque::new(),
+@@ -311,2 +317,7 @@ impl Decoder {
+
++    /// Exclusive PCM sample index of the latest successfully decoded frame.
++    pub fn last_frame_end(&self) -> usize {
++        self.last_frame_end
++    }
++
+     /// Pop the next decoder event, if any.
+@@ -331,3 +342,3 @@ impl Decoder {
+         let min_needed = chirp_len + sc_total + self.plan.symbol_len();
+-        if self.buf.len() < min_needed {
++        if self.buf.len() < min_needed.max(self.expected_end) {
+             return;
+@@ -369,4 +380,3 @@ impl Decoder {
+                 if drop > 0 {
+-                    self.buf.drain(..drop);
+-                    self.scanned_len = self.scanned_len.saturating_sub(drop);
++                    self.advance_past(drop);
+                 }
+@@ -455,3 +465,9 @@ impl Decoder {
+                         framed_total = Some(ft);
+-                        total_blocks = Some(ft.div_ceil(kb).max(1));
++                        let blocks = ft.div_ceil(kb).max(1);
++                        let end = data_start + (blocks * nblock).div_ceil(bps) * sym_len;
++                        if end > self.buf.len() {
++                            self.expected_end = end;
++                            return;
++                        }
++                        total_blocks = Some(blocks);
+                         block0_data = Some(data0);
+@@ -487,7 +503,15 @@ impl Decoder {
+                     match decode_frame(&data) {
+-                        Ok(payload) => self.events.push_back(Event::Decoded(payload)),
+-                        Err(e) => self.events.push_back(Event::Failed(e)),
++                        Ok(payload) => {
++                            let consumed = data_start + sym_idx * sym_len;
++                            self.last_frame_end = self.discarded_samples + consumed;
++                            self.events.push_back(Event::Decoded(payload));
++                            self.advance_past(consumed);
++                        }
++                        Err(e) => {
++                            self.events.push_back(Event::Failed(e));
++                            // A truncated frame can contain the next frame
++                            // within its declared extent. Search that audio again.
++                            self.advance_past(chirp_start + chirp_len);
++                        }
+                     }
+-                    let consumed = data_start + sym_idx * sym_len;
+-                    self.advance_past(consumed);
+                     return;
+@@ -513,3 +537,5 @@ impl Decoder {
+         self.buf.drain(..n);
++        self.discarded_samples += n;
+         self.scanned_len = 0;
++        self.expected_end = 0;
+     }

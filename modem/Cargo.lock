@@ -503,6 +503,7 @@ dependencies = [
  "getrandom",
  "num-complex",
  "sonance",
+ "sonance-link",
  "wasm-bindgen",
 ]
 
