@@ -2,13 +2,14 @@ import { crc } from './protocol.js';
 
 export const PCM_RATE = 48000;
 export const TRIAL_SECONDS = 60;
+const SONANCE_GAP_SAMPLES = 512;
 export const PROFILES = {
   balanced: { profile: 'balanced', gap: 6720 },
-  fast: { profile: 'fast', gap: 512 },
-  fastwide: { profile: 'fastwide', gap: 512 },
-  'auto-16': { profile: 'auto', rung: 3, gap: 512 },
-  'auto-64': { profile: 'auto', rung: 4, gap: 512 },
-  'auto-256': { profile: 'auto', rung: 6, gap: 512 },
+  fast: { profile: 'fast', gap: SONANCE_GAP_SAMPLES },
+  fastwide: { profile: 'fastwide', gap: SONANCE_GAP_SAMPLES },
+  'auto-16': { profile: 'auto', rung: 3, gap: SONANCE_GAP_SAMPLES },
+  'auto-64': { profile: 'auto', rung: 4, gap: SONANCE_GAP_SAMPLES },
+  'auto-256': { profile: 'auto', rung: 6, gap: SONANCE_GAP_SAMPLES },
 };
 
 export const BENCHMARK = 1;
@@ -125,13 +126,13 @@ export class BenchmarkReceiver {
     this.plan = plan;
   }
 
-  add(packet, info, arrivalMs, captureSample) {
+  add(packet, info, timing) {
     if (packet.session !== this.session || Object.keys(this.plan).some(key => this.plan[key] !== info[key])) return false;
     if (this.received.has(packet.sequence)) {
       this.duplicates++;
       return true;
     }
-    this.received.set(packet.sequence, { sequence: packet.sequence, ids: info.ids, arrivalMs, captureSample,
+    this.received.set(packet.sequence, { sequence: packet.sequence, ids: info.ids, ...timing,
       checksum: packet.checksum, wireBytes: packet.wireBytes });
     return true;
   }
@@ -142,11 +143,15 @@ export class BenchmarkReceiver {
     const elapsed = packets.slice(1).map((item, i) => item.arrivalMs - packets[i].arrivalMs);
     const missingPackets = Array.from({ length: this.plan.expectedPackets }, (_, seq) => seq)
       .filter(seq => !this.received.has(seq));
+    const release = packets.map(item => item.decoderReleaseMs)
+      .filter(value => Number.isFinite(value) && value >= 0);
     return {
       session: this.session, ...this.plan, seconds: TRIAL_SECONDS, packets, records, missingPackets,
       duplicates: this.duplicates, usefulBps: records * this.plan.size * 8 / TRIAL_SECONDS,
       modemPayloadBps: packets.reduce((sum, item) => sum + item.wireBytes, 0) * 8 / TRIAL_SECONDS,
       arrivalIntervalMs: distribution(elapsed),
+      decoderReleaseMs: distribution(release), invalidReleaseSamples: packets.length - release.length,
+      decoderReleaseBasis: 'estimated last PHY sample on receiver audio timeline to main-thread packet receipt',
     };
   }
 }

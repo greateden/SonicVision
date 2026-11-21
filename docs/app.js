@@ -1,12 +1,12 @@
 import init, { encode, sample_rate } from './modem/sonance_wasm.js';
 import { compress, packet, unpack, sizes, colourSize, guard, benchmarkCount, benchmarkPayload } from './protocol.js';
-import { BENCHMARK, PCM_RATE, PROFILES, TRIAL_SECONDS, BenchmarkReceiver, makeBenchmark, verifyBenchmark } from './stream.js';
+import { BENCHMARK, PCM_RATE, PROFILES, TRIAL_SECONDS, BenchmarkReceiver, makeBenchmark, unpackStream, verifyBenchmark } from './stream.js';
 import { Playout } from './playout.js';
 import { CODECS, FRAME_COUNT, drawTestFrame, probeVideo } from './video.js';
 import { VideoView, VideoTrial } from './video-run.js';
 
 const el = id => document.getElementById(id);
-const modes = ['send', 'receive', 'loop', 'bench', 'colour', 'air'];
+const modes = ['send', 'receive', 'legacy-receive', 'loop', 'bench', 'colour'];
 const camera = el('camera');
 const capture = document.createElement('canvas');
 const captureContext = capture.getContext('2d', { willReadFrequently: true });
@@ -21,14 +21,16 @@ let offline = false;
 function report(run) {
   return {
     schema: 1, mode: run.mode, medium: run.mode === 'colour' ? 'browser digital' :
-      run.mode === 'loop' ? 'software PCM' : 'physical air',
+      run.mode === 'loop' ? 'software PCM' : 'speaker/microphone path',
     complete: run.complete ?? false, userAgent: navigator.userAgent, offlineAssetsReady: offline,
     elapsedSeconds: (performance.now() - run.started) / 1000,
-    session: run.session, phy: run.phy, microphone: run.settings, gain: run.gain?.gain.value,
+    session: run.session, phy: run.phy, microphone: run.settings, speakerGain: run.startGain,
+    direction: run.direction, distanceCm: run.distanceCm,
+    captureSeconds: run.listenStarted === undefined ? undefined : (performance.now() - run.listenStarted) / 1000,
     interrupted: run.interrupted ?? false, captureGaps: run.gaps ?? 0, droppedCaptureSamples: run.droppedCapture ?? 0,
     modemErrors: run.modemErrors, rejectedPackets: run.rejected ?? 0,
     byteRx: run.byteReceiver?.report(), byteTx: run.byteSender,
-    audio: run.playout?.report(), videoTx: run.trial?.report(), videoRx: run.view?.report(),
+    audio: run.playout?.report(), videoTx: run.trial?.report(), videoRx: run.view?.report(), videoVerification: run.verification,
   };
 }
 
@@ -47,16 +49,17 @@ function status(text) { el('status').textContent = text; }
 
 function buttons() {
   for (const mode of modes) el(mode).disabled = !ready || Boolean(active);
-  if (!secure) el('receive').disabled = true;
+  if (!secure) for (const mode of ['receive', 'legacy-receive']) el(mode).disabled = true;
   el('stop').disabled = !active;
-  for (const id of ['source', 'size', 'fps', 'codec', 'colour-size', 'bitrate-target', 'phy', 'record-size', 'batch']) {
+  for (const id of ['source', 'size', 'fps', 'codec', 'colour-size', 'bitrate-target', 'phy', 'record-size', 'batch', 'direction', 'distance']) {
     el(id).disabled = Boolean(active);
   }
+  el('gain').disabled = active?.mode === 'bench';
   el('export').disabled = !active && !lastReport;
 }
 
 function stop(run, message = 'Stopped.') {
-  if (active !== run) return;
+  if (!run || active !== run) return;
   lastReport = report(run);
   active = undefined;
   clearTimeout(run.timer);
@@ -70,7 +73,6 @@ function stop(run, message = 'Stopped.') {
   run.context?.close().catch(() => {});
   run.worker?.terminate();
   run.cancelDecoder?.();
-  el('mic').textContent = 'Microphone idle.';
   buttons();
   status(message);
 }
@@ -121,21 +123,23 @@ function updateStats(run) {
     el('benchmark').textContent = `${result.records}/${result.expectedPackets * result.batch} verified records · ${Math.round(result.usefulBps)} bit/s over 60 s · ${result.missingPackets.length} missing packets so far`;
     el('bitrate').textContent = `${Math.round(result.usefulBps)} bit/s useful`;
     el('loss').textContent = `${(100 * result.missingPackets.length / result.expectedPackets).toFixed(1)}% so far`;
+    if (result.decoderReleaseMs) el('latency').textContent = `${result.decoderReleaseMs.p95.toFixed(1)} ms p95 after PHY end`;
     return;
   }
   if (run.trial || run.view?.assembler) {
     const tx = run.trial?.report();
     const rx = run.view?.report();
     el('rate').textContent = rx ? `${rx.displayedFps.toFixed(2)} fps drawn · ${rx.decoded} decoded` : '—';
-    el('bitrate').textContent = tx ? `${Math.round(tx.codecBps)} bit/s encoded` : `${Math.round(rx.modemPayloadBps)} bit/s modem payload`;
+    el('bitrate').textContent = tx ? `${Math.round(tx.codecBps)} bit/s encoded` : '—';
     el('loss').textContent = rx ? `${rx.missingPacketsLowerBound} observed packet gaps · ${rx.freezeCount} freezes` : `${tx.sendDrops} admission drops`;
-    el('latency').textContent = rx?.latencyMs ? `${rx.latencyMs.p95} ms p95 to canvas` : rx ? 'External measurement needed' : '—';
+    el('latency').textContent = rx?.latencyMs ? `${rx.latencyMs.p95.toFixed(1)} ms p95 to canvas` : '—';
     el('progress').textContent = [
       tx ? `${tx.captured}/${FRAME_COUNT} captured · ${tx.encoded} encoded · peak keyframe ${tx.keyBytes?.max ?? '—'} B` : '',
       rx ? `${rx.displayed} distinct frames drawn${rx.markerVerified === null ? '' : ` · ${rx.markerVerified} visual IDs verified`}` : '',
     ].filter(Boolean).join(' · ');
     return;
   }
+  if (run.mode === 'receive') return;
   const now = performance.now();
   const seconds = Math.min(5, (now - run.started) / 1000);
   run.recent = run.recent.filter(item => item.time > now - 5000);
@@ -194,8 +198,8 @@ function startDecoder(run, inputRate) {
   run.decoderSettings = { profile: phy.profile, rung: phy.rung, inputRate, modemRate };
   run.statsTimer = setInterval(() => {
     updateStats(run);
-    if (run.mode === 'receive') {
-      status(`Listening · ${run.received || 0} packets received · ${run.failures} modem errors · ${run.gaps || 0} capture gaps`);
+    if (run.node) {
+      status(`Listening · ${run.byteReceiver?.received.size ?? run.received ?? 0} packets received · ${run.failures} modem errors · ${run.gaps || 0} capture gaps`);
     }
   }, 250);
   return new Promise(resolve => {
@@ -216,17 +220,17 @@ function startDecoder(run, inputRate) {
         run.failures += count;
       }
       run.rejected += data.rejected;
-      for (const frame of data.frames) receiveFrame(run, frame);
+      if (run.mode !== 'receive') for (const frame of data.frames) receiveFrame(run, frame);
       for (const packet of data.packets) {
-        const timing = { receivedAt: performance.now(), captureSample: data.captureSample };
-        if (packet.kind === BENCHMARK) {
+        if (run.mode === 'receive' && packet.kind === BENCHMARK) {
           const info = verifyBenchmark(packet);
           if (!info) { run.rejected++; continue; }
           run.byteReceiver ??= new BenchmarkReceiver(packet.session, info);
-          if (!run.byteReceiver.add(packet, info, timing.receivedAt, timing.captureSample)) run.rejected++;
-        } else {
-          run.view ??= new VideoView(el('in'));
-          run.view.push(packet, timing);
+          const releaseSample = run.context.currentTime * run.context.sampleRate;
+          if (!run.byteReceiver.add(packet, info, {
+            arrivalMs: performance.now(), captureEndSample: packet.captureEndSample, blockEndSample: data.captureSample,
+            decoderReleaseMs: (releaseSample - packet.captureEndSample) * 1000 / run.context.sampleRate,
+          })) run.rejected++;
         }
       }
       if (run.node) run.node.port.postMessage(null);
@@ -279,6 +283,7 @@ async function listen(run) {
   };
   // The processor emits silence, keeping the mic graph running without monitor feedback.
   context.createMediaStreamSource(stream).connect(node).connect(context.destination);
+  run.listenStarted = performance.now();
   const settings = stream.getAudioTracks()[0].getSettings();
   // Export signal-path settings without stable device identifiers.
   run.settings = { contextRate: context.sampleRate, sampleRate: settings.sampleRate, channelCount: settings.channelCount,
@@ -355,11 +360,13 @@ function startBenchmark(run) {
     if (active !== run) return;
     try {
       while (run.sequence < plan.expectedPackets && run.playout.ahead < .5 * PCM_RATE) {
-        const pcm = toPCM(makePacket(run.sequence));
+        const packet = makePacket(run.sequence);
+        const pcm = toPCM(packet);
         if (pcm.length !== plan.packetSamples) throw new Error('Variable benchmark waveform length.');
         const startSample = run.playout.play(pcm, run.phy.gap, true);
         if (startSample === undefined) throw new Error('Playback missed a scheduled slot. Retry the trial.');
-        run.byteSender.packets.push({ sequence: run.sequence++, startSample, waveformSamples: pcm.length });
+        run.byteSender.packets.push({ sequence: run.sequence++, startSample, waveformSamples: pcm.length,
+          checksum: unpackStream(packet).checksum });
       }
       if (run.playout.now >= TRIAL_SECONDS * PCM_RATE) {
         run.complete = true;
@@ -376,33 +383,41 @@ function startBenchmark(run) {
 function finishColour(run) {
   updateStats(run);
   run.complete = true;
-  const result = run.view?.report();
-  stop(run, result ? `Trial ended · ${result.displayed}/${FRAME_COUNT} distinct frames drawn.` :
-    'Experimental video trial ended. Export the results from both devices.');
+  const result = run.view.report();
+  const checksums = new Map(run.trial.source.map(frame => [frame.id, frame.checksum]));
+  const exact = result.frames.filter(frame => checksums.get(frame.id) === frame.checksum).length;
+  run.verification = { displayedWithMatchingEncodedCRC: exact,
+    syntheticPass: !run.useCamera && exact === FRAME_COUNT && result.markerVerified === FRAME_COUNT &&
+      result.colourVerified === FRAME_COUNT && result.outOfOrder === 0 };
+  stop(run, `Trial ended · ${result.displayed}/${FRAME_COUNT} distinct frames drawn.`);
 }
 
 async function startColour(run) {
-  const size = Number(el('colour-size').value);
-  const codec = el('codec').value;
+  let size = Number(el('colour-size').value);
+  const selection = el('codec').value;
   const bitrate = Number(el('bitrate-target').value);
   const canvas = el('out');
-  [canvas.width, canvas.height] = sizes[size];
-  drawTestFrame(canvas, 0);
-  if (!await probeVideo(codec, size, bitrate, canvas)) {
+  let codec;
+  for (const candidateSize of selection === 'auto' && size === 1 ? [1, 0] : [size]) {
+    [canvas.width, canvas.height] = sizes[candidateSize];
+    drawTestFrame(canvas, 0);
+    for (const candidate of selection === 'auto' ? CODECS : [selection]) {
+      if (await probeVideo(candidate, candidateSize, bitrate, canvas)) { codec = candidate; break; }
+      if (active !== run) return;
+    }
+    if (codec) { size = candidateSize; break; }
+  }
+  if (!codec) {
     stop(run, 'This codec configuration failed its encode/decode check. Try the other codec, 32 × 24 or the bitmap fallback.');
     return;
   }
   if (active !== run) return;
-  if (run.mode === 'air') {
-    const { profile, rung, gap } = run.phy;
-    run.playout = new Playout(run.context, run.gain);
-    run.air = { encode: bytes => encode(profile, bytes, rung), gap, playout: run.playout };
-  } else run.view = new VideoView(el('in'), { local: true, marker: !run.useCamera });
+  run.view = new VideoView(el('in'), { marker: !run.useCamera });
   run.statsTimer = setInterval(() => updateStats(run), 250);
-  status(run.air ? 'Experimental compressed video over air' : 'Digital colour trial · 60 seconds');
+  status(`Digital colour trial · ${sizes[size].join(' × ')} · ${codec === 'vp8' ? 'VP8' : 'H.264'} · 60 seconds`);
   // Start outside the constructor so a synchronous capture error can clean it up.
   run.trial = new VideoTrial({ codec, size, bitrate, session: run.session, canvas, camera: run.useCamera ? camera : null,
-    view: run.view, air: run.air, alive: () => active === run, complete: () => finishColour(run),
+    view: run.view, alive: () => active === run, complete: () => finishColour(run),
     error: error => stop(run, error.message) });
   run.trial.capture(0);
 }
@@ -412,23 +427,31 @@ async function start(mode) {
   const run = active = {
     mode, session: crypto.getRandomValues(new Uint32Array(1))[0], sequence: 0,
     recent: [], failures: 0, modemErrors: {}, rejected: 0, droppedCapture: 0, started: performance.now(),
-    phy: ['send', 'loop'].includes(mode) ? PROFILES.balanced : PROFILES[el('phy').value],
-    useCamera: !['bench', 'receive'].includes(mode) && el('source').value === 'camera',
+    phy: mode === 'colour' ? undefined : ['send', 'loop', 'legacy-receive'].includes(mode) ?
+      PROFILES.balanced : PROFILES[el('phy').value],
+    direction: ['bench', 'receive'].includes(mode) ? el('direction').value : undefined,
+    distanceCm: ['bench', 'receive'].includes(mode) ? el('distance').valueAsNumber : undefined,
+    useCamera: ['send', 'loop', 'colour'].includes(mode) && el('source').value === 'camera',
   };
   buttons();
+  el('mic').textContent = 'Microphone idle.';
   el('benchmark').hidden = true;
   el('progress').textContent = '';
   for (const key of ['bitrate', 'rate', 'loss', 'latency']) el(key).textContent = '—';
-  for (const id of ['out', 'in']) el(id).getContext('2d').clearRect(0, 0, el(id).width, el(id).height);
+  for (const id of ['out', 'in']) {
+    const canvas = el(id);
+    canvas.getContext('2d', { willReadFrequently: id === 'in' }).clearRect(0, 0, canvas.width, canvas.height);
+  }
   status('Starting…');
   try {
+    if (run.distanceCm !== undefined && !(run.distanceCm > 0)) throw new Error('Enter the measured separation in centimetres.');
     if (mode !== 'loop' && mode !== 'colour') {
       try { run.context = new AudioContext({ sampleRate: PCM_RATE }); }
       catch { run.context = new AudioContext(); }
       await run.context.resume();
       if (active !== run) return;
     }
-    if (mode === 'receive') {
+    if (['receive', 'legacy-receive'].includes(mode)) {
       await listen(run);
       return;
     }
@@ -447,10 +470,11 @@ async function start(mode) {
     } else if (run.context) {
       run.gain = run.context.createGain();
       run.gain.gain.value = Number(el('gain').value);
+      run.startGain = run.gain.gain.value;
       run.gain.connect(run.context.destination);
     }
     if (mode === 'bench') startBenchmark(run);
-    else if (mode === 'colour' || mode === 'air') await startColour(run);
+    else if (mode === 'colour') await startColour(run);
     else sendNext(run);
   } catch (error) {
     stop(run, error.message);
@@ -461,7 +485,7 @@ for (const mode of modes) el(mode).addEventListener('click', () => start(mode));
 el('stop').addEventListener('click', () => stop(active));
 el('export').addEventListener('click', () => saveReport(active));
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden && active && ['bench', 'air', 'colour', 'receive'].includes(active.mode)) {
+  if (document.hidden && active && ['bench', 'colour', 'receive'].includes(active.mode)) {
     active.interrupted = true;
     stop(active, 'Trial interrupted when the tab lost visibility.');
   }

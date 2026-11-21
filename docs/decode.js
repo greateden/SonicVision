@@ -5,12 +5,14 @@ import { isStream, unpackStream } from './stream.js';
 let decoder;
 let resampler;
 let settings;
+let inputOrigin;
 const modem = init();
 
 function reset() {
   decoder?.free();
   decoder = new WasmDecoder(settings.profile, settings.rung);
   resampler = new Resampler(settings.inputRate, settings.modemRate);
+  inputOrigin = undefined;
 }
 
 self.onmessage = async ({ data }) => {
@@ -23,6 +25,9 @@ self.onmessage = async ({ data }) => {
       return;
     }
     if (data.gap) reset();
+    if (inputOrigin === undefined && data.captureSample !== undefined) {
+      inputOrigin = data.captureSample - data.samples.length;
+    }
     const frames = [];
     const packets = [];
     let rejected = 0;
@@ -34,7 +39,11 @@ self.onmessage = async ({ data }) => {
         const stream = isStream(bytes);
         const frame = stream ? unpackStream(bytes) : unpack(bytes);
         if (!frame) rejected++;
-        else if (stream) packets.push(frame);
+        else if (stream) {
+          const modemEndSample = decoder.message_end_sample();
+          packets.push({ ...frame, modemEndSample, captureEndSample: inputOrigin === undefined ? undefined :
+            inputOrigin + modemEndSample * settings.inputRate / settings.modemRate });
+        }
         else frames.push(frame);
       }
     }

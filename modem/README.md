@@ -1,28 +1,40 @@
-# Modem choice
+# Modem build and verification
 
-The comparison used the upstream source commits below.
+[Sonance](https://github.com/sjqtentacles/sonance) is pinned to `c483e3336f76cbf37abbeb6403659da87be5c157`. Upstream superframes pack multiple fountain symbols behind one PHY preamble, and its stream wrapper releases the completed file. SonicVision instead packs one, four or eight numbered test records into a single CRC-protected PHY payload and releases each batch as soon as the PHY validates it. Each batch has a preamble. The sender schedules PCM on a single sample clock with Sonance's 512-sample inter-frame gap in the experimental profiles. Balanced retains the 140 ms control. Auto experiments specify matching modulation/FEC rungs manually at both ends.
 
-| Modem | Implementation and browser fit | Evidence and streaming |
-| --- | --- | --- |
-| [Sonance](https://github.com/sjqtentacles/sonance) · MIT · `c483e3336f76cbf37abbeb6403659da87be5c157` | Rust OFDM with LDPC and existing wasm-bindgen exports. The demo uses Web Audio and ScriptProcessor with a fixed 48 kHz assumption. SonicVision uses AudioWorklet and resamples microphone PCM when needed. | Upstream reports simulated 1 KB goodput of 2.5 kb/s for Balanced, 3.6 kb/s for Balanced superframes and 15.0 kb/s for Auto superframes at 32 dB AWGN. Its inspected field-results table is pending. The single-packet `encode` and incremental `WasmDecoder.push` suit live frames. Fountain APIs emit completed transfers and add buffering and redundancy. |
-| [Cyrinx](https://github.com/dweekly/cyrinx) · Apache-2.0 with NOTICE · `cba849ed8eafdc06362b390dd9919c54ca99ce53` | Portable C codecs and native audio harnesses. Bulk and batch C APIs take PCM buffers. A browser port could compile the DSP subset with Emscripten and the vendored double-precision KissFFT backend, excluding Apple Accelerate and native transport timing/sleep. It would need exported buffers/functions and browser-side acquisition/framing around the bulk decoder. The portable DSP subset linked on macOS with KissFFT. A browser WASM build remains untested. | Upstream reports 65.875 kb/s verified payload for a specific Mac → Pixel recording/replay schedule and historical native iPhone results of 36.57 kb/s Mac → iPhone and 16.87 kb/s the other way. These runs use different native/offline paths. Its stream IDs belong to the native transport API. |
-| [Sonic Transfer](https://github.com/arashtabaa/sonic-transfer) · MIT with notices · `30b643e3ccbdb192d0e527ab291eb3172dacc57b` | Browser TypeScript/Nuxt file app. Production waveform code uses MFSK despite the BFSK class name. Experimental multitone paths are separate. | Streaming demodulation feeds a fountain decoder that reconstructs files. The production throughput note describes synthetic PCM-length benchmarks and a future ≥2 kb/s target. No comparable validated Mac ↔ iPhone goodput was found in the inspected documentation. |
+The [source patch](sonance-auto.patch) exposes the Auto rungs and the sample index of each validated frame's end. It also preserves buffered audio for reacquisition when a truncated PHY frame fails its CRC, and skips repeated demodulation while waiting for the end declared in a validated header.
 
-SonicVision uses Sonance Balanced, audible OFDM over roughly 1–9 kHz. Each video packet carries an independent RGB332 or 1-bit monochrome frame and an application CRC. A subsequent valid frame restores the image after loss. At 15 fps, raw 32 × 24 RGB332 alone requires 92.16 kb/s. The 140 ms guard by itself caps one-packet-per-frame transport below 7.15 fps.
-
-The browser probes VP8 and H.264 encode/decode support at runtime. In a separate Chromium experiment, 25 frames at 128 × 96 and 5 fps with a 4 kb/s real-time target and a keyframe every ten frames produced 1.89 kb/s VP8 and 1.72 kb/s H.264 for a moving rectangle. A seeded, changing colour texture produced 73.1 and 157.7 kb/s respectively, before modem overhead. Even the smallest tested moving-rectangle keyframe would exceed 200 ms as a standalone Sonance packet. A temporal codec would need measured link capacity, batching and keyframe recovery.
-
-SonicVision uses the unmodified upstream WASM crate with default features, Rust 1.93.1, wasm-bindgen CLI 0.2.125 and the [checked-in Cargo lockfile](Cargo.lock). The upstream crate is excluded from its workspace and needs its own lockfile. To reproduce from the pinned source checkout with the matching Rust target and CLI installed, copy this lockfile to `sonance-wasm/Cargo.lock` in that checkout, then run:
+To rebuild with Rust 1.93.1, the `wasm32-unknown-unknown` target and wasm-bindgen CLI 0.2.125, use a clean checkout at the pinned commit. From that checkout, set `SONICVISION` to the absolute path of this repository and run:
 
 ```sh
+git apply "$SONICVISION/modem/sonance-auto.patch"
+cp "$SONICVISION/modem/Cargo.lock" sonance-wasm/Cargo.lock
 cargo build --manifest-path sonance-wasm/Cargo.toml --locked --release --target wasm32-unknown-unknown
-wasm-bindgen --target web --no-typescript --out-dir /path/to/SonicVision/docs/modem sonance-wasm/target/wasm32-unknown-unknown/release/sonance_wasm.wasm
+wasm-bindgen --target web --no-typescript --out-dir "$SONICVISION/docs/modem" sonance-wasm/target/wasm32-unknown-unknown/release/sonance_wasm.wasm
 ```
 
 [Sonance licence](../docs/modem/LICENSE-sonance.txt) · [Dependency notices](../docs/modem/THIRD-PARTY.txt)
 
 ## Verification
 
-- Node 26.12.0 passed all six `npm test` checks. The sustained test recovered 100/100 packets after a 48 → 44.1 → 48 kHz PCM conversion. The seeded noise test recovered the exact bytes at 20 dB SNR.
-- Chromium and macOS Safari passed GitHub Pages digital loopback. WebKit passed loopback at an emulated iPhone viewport. Chromium also passed fake-camera capture and muted benchmark playback. A Chromium file-backed fake microphone delivered zero packets. A separate synthetic MediaStream through the actual AudioWorklet and decoder recovered all 19 supplied packets out of 20 expected, with one deliberate omission, no modem errors and no capture gaps.
-- A local mkcert HTTPS smoke test returned HTTP 200 with certificate validation and HTTP 404 for a private-key path. Physical Mac ↔ iPhone audio and iOS certificate installation remain unmeasured.
+The table uses 256-byte records and a 60-second generated PCM sample window. All five tests recovered every scheduled packet. The shorter-gap profiles also recovered the first intact packet after a truncation and a later erasure in a separate incremental test.
+
+| Sonance profile | Records per preamble | Valid PHY packets | Useful kb/s | Waveform per packet |
+| --- | ---: | ---: | ---: | ---: |
+| Balanced | 1 | 68 / 68 | 2.32 | 733 ms |
+| FastWide with 44.1 kHz capture conversion | 4 | 53 / 53 | 7.24 | 1,113 ms |
+| Auto rung 4 with 44.1 kHz capture conversion | 8 | 59 / 59 | 16.11 | 1,000 ms |
+| Auto rung 6 | 1 | 227 / 227 | 7.75 | 253 ms |
+| Auto rung 6 | 8 | 75 / 75 | 20.48 | 787 ms |
+
+A larger batch buys useful bitrate at the cost of delivery latency. Acoustic compressed video remains gated on direction-specific hardware evidence. The paired benchmark is ready to run, with Mac ↔ iPhone over-air results pending.
+
+## Bounded Cyrinx WASM probe
+
+The optional probe builds the portable bulk PHY and double-precision KissFFT backend from [Cyrinx](https://github.com/dweekly/cyrinx) at `cba849ed8eafdc06362b390dd9919c54ca99ce53` (Apache-2.0 plus upstream notices). It uses a fixed 32,768-sample input buffer and checks the upstream `qam16_r34` Python golden vectors. A [WASI SDK](https://github.com/WebAssembly/wasi-sdk) clang is required for this experiment only.
+
+```sh
+node modem/run-cyrinx-probe.mjs /path/to/pinned/cyrinx /path/to/wasi-sdk/bin/clang
+```
+
+WASI SDK 34 built a module that matched all 23,040 golden TX samples and recovered all four CRC-valid RX blocks (1,024 bytes) from both clean PCM and the upstream 28,300-sample multipath fixture. The same module passed in Node 26 and WebKit 27.2. This is a bounded bulk decode. The application ships only Sonance.

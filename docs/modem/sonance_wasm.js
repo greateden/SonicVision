@@ -61,6 +61,14 @@ export class WasmDecoder {
         return ret >>> 0;
     }
     /**
+     * Exclusive PCM sample index for the message returned by take_message.
+     * @returns {number}
+     */
+    message_end_sample() {
+        const ret = wasm.wasmdecoder_message_end_sample(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
      * @param {string} profile
      * @param {number | null} [rung]
      */

@@ -7,6 +7,13 @@ export const CODECS = ['vp8', 'avc1.42001f'];
 export const MAX_UNIT = 16384;
 const FRAGMENT_HEADER = 10;
 const VIDEO_KIND = 16;
+const frameTimestamp = id => Math.round(id * 1e6 / FPS);
+const frameDuration = id => frameTimestamp(id + 1) - frameTimestamp(id);
+// Media time conversions can round the returned timestamp by a microsecond.
+function sourceId(timestamp) {
+  const id = Math.round(timestamp * FPS / 1e6);
+  if (Math.abs(timestamp - frameTimestamp(id)) <= 2) return id;
+}
 
 export function videoFormat(kind) {
   const i = kind - VIDEO_KIND;
@@ -38,7 +45,7 @@ export function packetize(frames, { session, sequence, size, codec, marker = fal
       const length = Math.min(frame.data.length - offset, payloadLimit - used - FRAGMENT_HEADER);
       const last = offset + length === frame.data.length;
       view.setUint16(used, frame.id);
-      view.setUint32(used + 2, frame.captureMs);
+      view.setUint32(used + 2, frame.captureTenthsMs);
       view.setUint16(used + 6, offset);
       view.setUint16(used + 8, length | (frame.key ? 0x8000 : 0) | (last ? 0x4000 : 0));
       payload.set(frame.data.subarray(offset, offset + length), used + FRAGMENT_HEADER);
@@ -56,13 +63,13 @@ function fragments(payload) {
   for (let position = 0; position < payload.length;) {
     if (payload.length - position <= FRAGMENT_HEADER) return;
     const id = view.getUint16(position);
-    const captureMs = view.getUint32(position + 2);
+    const captureTenthsMs = view.getUint32(position + 2);
     const offset = view.getUint16(position + 6);
     const flags = view.getUint16(position + 8);
     const length = flags & 0x3fff;
     position += FRAGMENT_HEADER;
     if (!length || position + length > payload.length || offset + length > MAX_UNIT) return;
-    result.push({ id, captureMs, offset, key: Boolean(flags & 0x8000), last: Boolean(flags & 0x4000),
+    result.push({ id, captureTenthsMs, offset, key: Boolean(flags & 0x8000), last: Boolean(flags & 0x4000),
       data: payload.subarray(position, position + length) });
     position += length;
   }
@@ -90,12 +97,12 @@ export class VideoAssembler {
     for (const item of records) {
       if (item.id <= this.lastId) { this.duplicates++; continue; }
       if (!item.offset) {
-        const { id, key, captureMs } = item;
-        this.partial = { id, key, captureMs, used: 0, data: new Uint8Array(item.last ? item.data.length : MAX_UNIT) };
+        const { id, key, captureTenthsMs } = item;
+        this.partial = { id, key, captureTenthsMs, used: 0, data: new Uint8Array(item.last ? item.data.length : MAX_UNIT) };
       }
       const frame = this.partial;
       if (!frame || frame.id !== item.id || frame.key !== item.key ||
-          frame.captureMs !== item.captureMs || frame.used !== item.offset) {
+          frame.captureTenthsMs !== item.captureTenthsMs || frame.used !== item.offset) {
         this.partial = null;
         this.rejected++;
         continue;
@@ -104,7 +111,7 @@ export class VideoAssembler {
       frame.used += item.data.length;
       if (item.last) {
         const data = frame.data.subarray(0, frame.used);
-        output.push({ id: frame.id, key: frame.key, captureMs: frame.captureMs, data, checksum: crc(data) });
+        output.push({ id: frame.id, key: frame.key, captureTenthsMs: frame.captureTenthsMs, data, checksum: crc(data) });
         this.lastId = frame.id;
         this.partial = null;
       }
@@ -153,7 +160,7 @@ export async function probeVideo(codec, size, bitrate, canvas) {
       });
       decoder.configure(dec);
       encoder.configure(enc);
-      const frame = new VideoFrame(canvas, { timestamp: 123 });
+      const frame = new VideoFrame(canvas, { timestamp: 123, duration: frameDuration(0) });
       try { encoder.encode(frame, { keyFrame: true }); }
       finally { frame.close(); }
       encoder.flush().then(() => decoder.flush()).catch(() => resolve(false));
@@ -171,15 +178,17 @@ export async function probeVideo(codec, size, bitrate, canvas) {
 export class ColourEncoder {
   pending = new Map();
   peak = 0;
+  queuePeak = 0;
 
   constructor(codec, size, bitrate, output, error) {
     this.encoder = new VideoEncoder({
       output: chunk => {
-        const item = this.pending.get(chunk.timestamp);
+        const id = sourceId(chunk.timestamp);
+        const item = this.pending.get(id);
         if (!item) return;
         // A later output can overtake dropped input IDs in real-time mode.
-        for (const timestamp of this.pending.keys()) {
-          if (timestamp <= chunk.timestamp) this.pending.delete(timestamp);
+        for (const pendingId of this.pending.keys()) {
+          if (pendingId <= id) this.pending.delete(pendingId);
         }
         const data = new Uint8Array(chunk.byteLength);
         chunk.copyTo(data);
@@ -195,11 +204,14 @@ export class ColourEncoder {
     const [first] = this.pending.keys();
     // Bound metadata for inputs the encoder silently drops.
     if (this.pending.size >= 12) this.pending.delete(first);
-    const timestamp = Math.round(item.id * 1e6 / FPS);
-    const frame = new VideoFrame(canvas, { timestamp, duration: Math.round(1e6 / FPS) });
-    this.pending.set(timestamp, item);
+    const timestamp = frameTimestamp(item.id);
+    const frame = new VideoFrame(canvas, { timestamp, duration: frameDuration(item.id) });
+    this.pending.set(item.id, item);
     this.peak = Math.max(this.peak, this.pending.size);
-    try { this.encoder.encode(frame, { keyFrame: key }); }
+    try {
+      this.encoder.encode(frame, { keyFrame: key });
+      this.queuePeak = Math.max(this.queuePeak, this.encoder.encodeQueueSize);
+    }
     finally { frame.close(); }
     return true;
   }
@@ -214,6 +226,8 @@ export class ColourEncoder {
 export class ColourDecoder {
   pending = new Map();
   peak = 0;
+  queuePeak = 0;
+  stateChanges = [];
   last = -1;
   synced = false;
   dropped = 0;
@@ -225,7 +239,10 @@ export class ColourDecoder {
     this.output = output;
   }
 
-  reset() {
+  reset(reason) {
+    if (this.decoder && this.stateChanges.length < FRAME_COUNT) {
+      this.stateChanges.push({ id: this.last, state: 'waiting for key', reason });
+    }
     if (this.decoder && this.decoder.state !== 'closed') this.decoder.close();
     this.dropped += this.pending.size;
     this.pending.clear();
@@ -235,40 +252,48 @@ export class ColourDecoder {
 
   push(unit, timing) {
     if (unit.id <= this.last) return;
-    if (unit.id !== this.last + 1 || this.pending.size >= 12) this.reset();
+    if (unit.id !== this.last + 1) this.reset('source ID gap');
+    // H.264 implementations can retain decoded pictures internally even
+    // with optimizeForLatency and an empty decodeQueueSize.
+    else if (this.pending.size >= 24 || this.decoder?.decodeQueueSize >= 4) this.reset('decoder backlog');
     this.last = unit.id;
     if (!unit.key && !this.synced) { this.dropped++; return; }
     try {
       if (!this.decoder) {
         const decoder = this.decoder = new VideoDecoder({
           output: frame => {
-            const item = this.pending.get(frame.timestamp);
-            this.pending.delete(frame.timestamp);
+            const id = sourceId(frame.timestamp);
+            const item = this.pending.get(id);
+            this.pending.delete(id);
             if (item && decoder === this.decoder) this.output(frame, item);
             else frame.close();
           },
           error: () => {
             if (decoder !== this.decoder) return;
             this.errors++;
-            this.reset();
+            this.reset('decoder error');
           },
         });
         decoder.configure(this.config);
+        if (this.stateChanges.length < FRAME_COUNT) this.stateChanges.push({ id: this.last, state: 'configured' });
         if (this.last > 0) this.recoveries++;
       }
       const { data, ...metadata } = unit;
+      const timestamp = frameTimestamp(unit.id);
       this.pending.set(unit.id, { ...timing, ...metadata, encodedBytes: data.length });
       this.peak = Math.max(this.peak, this.pending.size);
-      this.decoder.decode(new EncodedVideoChunk({ type: unit.key ? 'key' : 'delta', timestamp: unit.id, data }));
+      this.decoder.decode(new EncodedVideoChunk({ type: unit.key ? 'key' : 'delta', timestamp,
+        duration: frameDuration(unit.id), data }));
+      this.queuePeak = Math.max(this.queuePeak, this.decoder.decodeQueueSize);
       this.synced = true;
     } catch {
       this.errors++;
-      this.reset();
+      this.reset('decode submission error');
     }
   }
 
   flush() { return this.decoder?.flush(); }
-  close() { this.reset(); }
+  close() { this.reset('closed'); }
 }
 
 // Fixed colour patches and a ten-bit luminance ID visible in the source and
